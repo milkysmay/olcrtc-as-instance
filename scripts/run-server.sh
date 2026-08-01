@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Phase 4: Launch olcrtc + log connection info + subscription name
-
 BINARY="/usr/local/bin/olcrtc"
 CONFIG_FILE="${CONFIG_FILE:-/opt/olcrtc/config/olcrtc.yaml}"
 LOG_DIR="${LOG_DIR:-/opt/olcrtc/logs}"
@@ -8,8 +6,8 @@ LOG_FILE="${LOG_DIR}/olcrtc-$(date '+%Y%m%d-%H%M%S').log"
 MODE="${OLCRTC_MODE:-srv}"
 SUBSCRIPTION_NAME="${SUBSCRIPTION_NAME:-🏳️ | unknown | unknown}"
 
-[[ ! -x "${BINARY}" ]] && { err "Binary not found: ${BINARY}"; exit 1; }
-[[ ! -f "${CONFIG_FILE}" ]] && { err "Config not found: ${CONFIG_FILE}"; exit 1; }
+[[ ! -x "${BINARY}" ]] && { err "Binary not found"; exit 1; }
+[[ ! -f "${CONFIG_FILE}" ]] && { err "Config not found"; exit 1; }
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════╗"
@@ -31,7 +29,6 @@ echo "  ${OLCRTC_URI}"
 echo "╚══════════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Save connection info
 INFO_FILE="${LOG_DIR}/connection-info.txt"
 cat > "${INFO_FILE}" <<EOF
 SUBSCRIPTION=${SUBSCRIPTION_NAME}
@@ -43,8 +40,7 @@ ROOM_ID=${ROOM_ID}
 CRYPTO_KEY=${CRYPTO_KEY}
 OLCRTC_URI=${OLCRTC_URI}
 EOF
-log "Connection info → ${INFO_FILE}"
+log "Info → ${INFO_FILE}"
 
-# Launch
 log "Starting olcrtc (${MODE})..."
 exec "${BINARY}" "${CONFIG_FILE}" 2>&1 | tee -a "${LOG_FILE}"
