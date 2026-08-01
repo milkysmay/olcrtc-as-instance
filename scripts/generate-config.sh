@@ -77,7 +77,8 @@ case "${SELECTED_TRANSPORT}" in
     seichannel)   PAYLOAD="<fps=30&batch=64&frag=900&ack-ms=2000>" ;;
     videochannel) PAYLOAD="<video-w=1080&video-h=1080&video-fps=30&video-bitrate=5000k&video-hw=none&video-codec=qrcode>" ;;
 esac
-OLCRTC_URI="olcrtc://${SELECTED_PROVIDER}?${SELECTED_TRANSPORT}${PAYLOAD}@${ROOM_ID}#${CRYPTO_KEY}\$auto / ${SELECTED_PROVIDER} / $(hostname)"
+HOST_LABEL=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "olcrtc-node")
+OLCRTC_URI="olcrtc://${SELECTED_PROVIDER}?${SELECTED_TRANSPORT}${PAYLOAD}@${ROOM_ID}#${CRYPTO_KEY}\$auto / ${SELECTED_PROVIDER} / ${HOST_LABEL}"
 
 export CRYPTO_KEY ROOM_ID OLCRTC_URI CONFIG_FILE
 
