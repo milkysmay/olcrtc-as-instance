@@ -78,22 +78,22 @@ FROM fedora:42
 RUN dnf update -y \
     && dnf install -y \
         bash coreutils openssl iputils curl ca-certificates \
-        bind-utils hostname bc gawk \
+        bind-utils hostname bc gawk python3 \
     && dnf clean all
 
-# Copy from Stage 0 (builder)
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
 COPY --from=0 /src/build/olcrtc-linux-amd64 /usr/local/bin/olcrtc
 RUN chmod +x /usr/local/bin/olcrtc
 
-# Copy from Stage 1 (scripts)
 COPY --from=1 /opt/olcrtc/scripts/ /opt/olcrtc/scripts/
-
-# Copy from Stage 2 (defaults)
 COPY --from=2 /opt/olcrtc/defaults/ /opt/olcrtc/defaults/
 
 WORKDIR /opt/olcrtc
 RUN mkdir -p /opt/olcrtc/config /opt/olcrtc/logs
 
+# ── Optional ENV ─────────────────────────────────────────────────────────────
 ENV OLCRTC_PROVIDER=""
 ENV OLCRTC_TRANSPORT=""
 ENV OLCRTC_JITSI_INSTANCE=""
@@ -105,11 +105,12 @@ ENV OLCRTC_SOCKS_HOST="0.0.0.0"
 ENV OLCRTC_SOCKS_PORT="1080"
 ENV OLCRTC_SOCKS_USER=""
 ENV OLCRTC_SOCKS_PASS=""
-ENV OLCRTC_DEBUG="true"
 ENV OLCRTC_UPSTREAM_PROXY_ADDR=""
 ENV OLCRTC_UPSTREAM_PROXY_PORT=""
 ENV OLCRTC_UPSTREAM_PROXY_USER=""
 ENV OLCRTC_UPSTREAM_PROXY_PASS=""
+ENV OLCRTC_TEST_ALL_PROVIDERS="false"
+ENV OLCRTC_DEBUG="true"
 
 EXPOSE 1080
 
