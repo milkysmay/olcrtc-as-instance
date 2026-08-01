@@ -33,11 +33,19 @@ if [[ "${SKIP_CHECK}" == "false" ]]; then
     source "${SCRIPTS_DIR}/check-providers.sh"
 fi
 
-# ENV overrides (ENV always wins)
-SELECTED_PROVIDER="${OLCRTC_PROVIDER:-${SELECTED_PROVIDER:-jitsi}}"
-SELECTED_TRANSPORT="${OLCRTC_TRANSPORT:-${SELECTED_TRANSPORT:-datachannel}}"
-SELECTED_INSTANCE="${OLCRTC_JITSI_INSTANCE:-${SELECTED_INSTANCE:-}}"
-SELECTED_ROOM_ID="${OLCRTC_ROOM_ID:-${SELECTED_ROOM_ID:-}}"
+# ENV overrides — only when the variable is NON-EMPTY (not just "set")
+if [[ -n "${OLCRTC_PROVIDER}" ]]; then
+    SELECTED_PROVIDER="${OLCRTC_PROVIDER}"
+fi
+if [[ -n "${OLCRTC_TRANSPORT}" ]]; then
+    SELECTED_TRANSPORT="${OLCRTC_TRANSPORT}"
+fi
+if [[ -n "${OLCRTC_JITSI_INSTANCE}" ]]; then
+    SELECTED_INSTANCE="${OLCRTC_JITSI_INSTANCE}"
+fi
+if [[ -n "${OLCRTC_ROOM_ID}" ]]; then
+    SELECTED_ROOM_ID="${OLCRTC_ROOM_ID}"
+fi
 
 log "Provider:  ${SELECTED_PROVIDER}"
 log "Transport: ${SELECTED_TRANSPORT}"
