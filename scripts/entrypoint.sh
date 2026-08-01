@@ -32,23 +32,24 @@ if [[ -n "${OLCRTC_PROVIDER}" && -n "${OLCRTC_ROOM_ID}" && -n "${OLCRTC_CRYPTO_K
     SELECTED_INSTANCE="${OLCRTC_JITSI_INSTANCE:-}"
     SELECTED_ROOM_ID="${OLCRTC_ROOM_ID}"
     SELECTED_FLAG="🏳️"
-    SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT}"
+    HOST_LABEL=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "olcrtc-node")
+    SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT} / ${HOST_LABEL}"
 fi
 
 if [[ "${SKIP_CHECK}" == "false" ]]; then
     source "${SCRIPTS_DIR}/check-providers.sh"
 fi
 
-# ENV overrides (only non-empty values)
+# ENV overrides (only non-empty)
 [[ -n "${OLCRTC_PROVIDER}" ]]       && SELECTED_PROVIDER="${OLCRTC_PROVIDER}"
 [[ -n "${OLCRTC_TRANSPORT}" ]]      && SELECTED_TRANSPORT="${OLCRTC_TRANSPORT}"
 [[ -n "${OLCRTC_JITSI_INSTANCE}" ]] && SELECTED_INSTANCE="${OLCRTC_JITSI_INSTANCE}"
 [[ -n "${OLCRTC_ROOM_ID}" ]]        && SELECTED_ROOM_ID="${OLCRTC_ROOM_ID}"
 
-# Rebuild subscription name after overrides
-if [[ -n "${OLCRTC_PROVIDER}" || -n "${OLCRTC_TRANSPORT}" ]]; then
-    SUBSCRIPTION_NAME="${SELECTED_FLAG:-🏳️} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT}"
-fi
+# Rebuild subscription after overrides
+HOST_LABEL="${HOST_LABEL:-$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "olcrtc-node")}"
+SELECTED_FLAG="${SELECTED_FLAG:-🏳️}"
+SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT} / ${HOST_LABEL}"
 
 log "Provider:     ${SELECTED_PROVIDER}"
 log "Transport:    ${SELECTED_TRANSPORT}"
