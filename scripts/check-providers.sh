@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Phase 2: Validate providers by ACTUALLY launching olcrtc and joining a room.
-# Step 1 — quick ping pre-filter (skip dead hosts)
-# Step 2 — real validation: run olcrtc in srv mode, check if room is created
-# Step 3 — detect country flag for subscription name
+#   Step 1 — quick ping pre-filter
+#   Step 2 — real validation via olcrtc (top-N jitsi, then others)
+#   Step 3 — detect country flag + build subscription name
+#
+# OLCRTC_TEST_ALL_PROVIDERS=true → also validate telemost/wbstream
+#   even when jitsi already passed (diagnostics only, does NOT change selection).
 
 OLCRTC_BIN="/usr/local/bin/olcrtc"
 
@@ -31,8 +34,8 @@ OTHER_PROVIDERS=(
 )
 
 PING_TIMEOUT=3; PING_COUNT=2; CURL_TIMEOUT=5
-VALIDATE_WAIT=6          # seconds to let olcrtc start
-MAX_VALIDATE_CANDIDATES=5  # don't test all 15 — only top-N by ping
+VALIDATE_WAIT=6
+MAX_VALIDATE_CANDIDATES=5
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -62,7 +65,6 @@ check_http() {
     [[ "${code}" != "000" ]]
 }
 
-# Resolve hostname → IPv4
 resolve_ip() {
     local host="$1" ip=""
     ip=$(dig +short "${host}" A 2>/dev/null | grep -oP '^\d+\.\d+\.\d+\.\d+$' | head -1)
@@ -70,44 +72,42 @@ resolve_ip() {
     echo "${ip}"
 }
 
-# Country code → flag emoji  (NL → 🇳🇱, RU → 🇷🇺)
+# Country code → flag emoji (python3 primary, bash printf fallback)
 country_to_flag() {
     local cc="${1^^}"
     [[ ${#cc} -ne 2 ]] && { echo "🏳️"; return; }
-    local flag="" i c ascii code hex
-    for (( i=0; i<2; i++ )); do
-        c="${cc:$i:1}"
-        ascii=$(printf '%d' "'${c}")
-        code=$(( 0x1F1E6 + ascii - 65 ))
-        hex=$(printf '%08x' "${code}")
-        flag+="$(printf "\\U${hex}")"
-    done
-    echo "${flag}"
+
+    local flag=""
+    flag=$(python3 -c "print(''.join(chr(0x1F1E6+ord(c)-65) for c in '${cc}'))" 2>/dev/null)
+
+    if [[ -z "${flag}" ]]; then
+        local i c ascii code hex
+        for (( i=0; i<2; i++ )); do
+            c="${cc:$i:1}"
+            ascii=$(printf '%d' "'${c}")
+            code=$(( 0x1F1E6 + ascii - 65 ))
+            hex=$(printf '%08x' "${code}")
+            flag+="$(printf "\\U${hex}" 2>/dev/null)"
+        done
+    fi
+
+    [[ -n "${flag}" ]] && echo "${flag}" || echo "🏳️"
 }
 
-# Detect country flag for a hostname
 get_flag_for_host() {
     local host="$1" ip cc=""
     ip=$(resolve_ip "${host}")
-    if [[ -z "${ip}" ]]; then echo "🏳️"; return; fi
+    [[ -z "${ip}" ]] && { echo "🏳️"; return; }
 
-    # Try ip-api.com (free, HTTP only)
     cc=$(curl -s --connect-timeout 3 \
         "http://ip-api.com/json/${ip}?fields=countryCode" 2>/dev/null \
         | grep -oP '"countryCode"\s*:\s*"\K[A-Z]{2}')
 
-    # Fallback: ipwho.is
-    if [[ -z "${cc}" ]]; then
-        cc=$(curl -s --connect-timeout 3 \
-            "https://ipwho.is/${ip}" 2>/dev/null \
-            | grep -oP '"country_code"\s*:\s*"\K[A-Z]{2}')
-    fi
+    [[ -z "${cc}" ]] && cc=$(curl -s --connect-timeout 3 \
+        "https://ipwho.is/${ip}" 2>/dev/null \
+        | grep -oP '"country_code"\s*:\s*"\K[A-Z]{2}')
 
-    if [[ -n "${cc}" ]]; then
-        country_to_flag "${cc}"
-    else
-        echo "🏳️"
-    fi
+    [[ -n "${cc}" ]] && country_to_flag "${cc}" || echo "🏳️"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -129,7 +129,6 @@ validate_with_olcrtc() {
     tmp_cfg="/tmp/olcrtc-val-${provider}-${RANDOM}.yaml"
     tmp_log="/tmp/olcrtc-val-${provider}-${RANDOM}.log"
 
-    # Write temporary config
     cat > "${tmp_cfg}" <<EOF
 mode: srv
 auth:
@@ -151,43 +150,35 @@ EOF
         videochannel) printf '\nvideo:\n  codec: qrcode\n  width: 1080\n  height: 1080\n  fps: 30\n  bitrate: "5000k"\n  hw: none\n' >> "${tmp_cfg}" ;;
     esac
 
-    # Launch olcrtc in background
     "${OLCRTC_BIN}" "${tmp_cfg}" > "${tmp_log}" 2>&1 &
     pid=$!
 
-    # Poll for up to VALIDATE_WAIT seconds
     while (( elapsed < VALIDATE_WAIT )); do
         sleep 1
         elapsed=$((elapsed + 1))
 
-        # Process died early?
         if ! kill -0 "${pid}" 2>/dev/null; then
             wait "${pid}" 2>/dev/null
-            local rc=$?
-            [[ ${rc} -eq 0 ]] && success=true
+            [[ $? -eq 0 ]] && success=true
             break
         fi
 
-        # Positive indicators in log
         if grep -qiE 'room.*(created|ready|started)|connected|listening|initialized' "${tmp_log}" 2>/dev/null; then
             success=true
             break
         fi
 
-        # Fatal errors → stop waiting
         if grep -qiE 'panic|fatal|failed to (connect|create|join|dial)|connection refused|no such host|unreachable' "${tmp_log}" 2>/dev/null; then
             break
         fi
     done
 
-    # If process is still alive after full wait and no errors → success
     if (( elapsed >= VALIDATE_WAIT )) && kill -0 "${pid}" 2>/dev/null; then
         if ! grep -qiE 'panic|fatal|failed|error|refused' "${tmp_log}" 2>/dev/null; then
             success=true
         fi
     fi
 
-    # Cleanup
     kill "${pid}" 2>/dev/null
     wait "${pid}" 2>/dev/null
     rm -f "${tmp_cfg}" "${tmp_log}"
@@ -196,9 +187,9 @@ EOF
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Quick ping pre-filter
+# STEP 1 — Ping pre-filter
 # ──────────────────────────────────────────────────────────────────────────────
-log "Step 1/3: Ping pre-filter for Jitsi instances (${#JITSI_INSTANCES[@]} hosts)..."
+log "Step 1/3: Ping pre-filter (${#JITSI_INSTANCES[@]} Jitsi hosts)..."
 
 declare -a REACHABLE_HOSTS=()
 declare -a REACHABLE_LATENCY=()
@@ -216,19 +207,19 @@ for instance in "${JITSI_INSTANCES[@]}"; do
 done
 echo ""
 
-# Sort reachable hosts by latency (simple insertion sort)
+# Sort by latency (insertion sort)
 if (( ${#REACHABLE_HOSTS[@]} > 1 )); then
     for (( i=1; i<${#REACHABLE_HOSTS[@]}; i++ )); do
-        local_h="${REACHABLE_HOSTS[$i]}"
-        local_l="${REACHABLE_LATENCY[$i]}"
+        lh="${REACHABLE_HOSTS[$i]}"
+        ll="${REACHABLE_LATENCY[$i]}"
         j=$((i - 1))
-        while (( j >= 0 )) && (( REACHABLE_LATENCY[j] > local_l )); do
+        while (( j >= 0 )) && (( REACHABLE_LATENCY[j] > ll )); do
             REACHABLE_HOSTS[$((j+1))]="${REACHABLE_HOSTS[$j]}"
             REACHABLE_LATENCY[$((j+1))]="${REACHABLE_LATENCY[$j]}"
             j=$((j - 1))
         done
-        REACHABLE_HOSTS[$((j+1))]="${local_h}"
-        REACHABLE_LATENCY[$((j+1))]="${local_l}"
+        REACHABLE_HOSTS[$((j+1))]="${lh}"
+        REACHABLE_LATENCY[$((j+1))]="${ll}"
     done
 fi
 
@@ -236,9 +227,9 @@ log "Reachable: ${#REACHABLE_HOSTS[@]} / ${#JITSI_INSTANCES[@]}"
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Real validation via olcrtc (top-N candidates)
+# STEP 2 — Real validation via olcrtc
 # ──────────────────────────────────────────────────────────────────────────────
-log "Step 2/3: Real validation — creating room via olcrtc (top ${MAX_VALIDATE_CANDIDATES})..."
+log "Step 2/3: Real validation via olcrtc (top ${MAX_VALIDATE_CANDIDATES} Jitsi)..."
 echo ""
 
 SELECTED_PROVIDER=""
@@ -246,9 +237,8 @@ SELECTED_TRANSPORT=""
 SELECTED_INSTANCE=""
 SELECTED_ROOM_ID=""
 SELECTED_FLAG="🏳️"
-SUBSCRIPTION_NAME=""
 
-# 2a. Try Jitsi candidates
+# 2a. Jitsi candidates
 limit=$(( ${#REACHABLE_HOSTS[@]} < MAX_VALIDATE_CANDIDATES ? ${#REACHABLE_HOSTS[@]} : MAX_VALIDATE_CANDIDATES ))
 for (( i=0; i<limit; i++ )); do
     inst="${REACHABLE_HOSTS[$i]}"
@@ -268,10 +258,10 @@ for (( i=0; i<limit; i++ )); do
     fi
 done
 
-# 2b. If no Jitsi passed — try other providers
+# 2b. Fallback: other providers (only if no Jitsi passed)
 if [[ -z "${SELECTED_PROVIDER}" ]]; then
     echo ""
-    log "No Jitsi instance passed validation. Trying other providers..."
+    log "No Jitsi passed. Trying other providers..."
     for entry in "${OTHER_PROVIDERS[@]}"; do
         IFS=':' read -r pname phost ptransport <<< "${entry}"
         printf "  ▸ %s / %s / %-35s ... " "${pname}" "${ptransport}" "${phost}"
@@ -290,9 +280,32 @@ if [[ -z "${SELECTED_PROVIDER}" ]]; then
     done
 fi
 
-# 2c. Last resort
+# 2c. TEST_ALL_PROVIDERS: validate remaining providers for diagnostics
+if [[ "${OLCRTC_TEST_ALL_PROVIDERS:-false}" == "true" ]]; then
+    echo ""
+    log "OLCRTC_TEST_ALL_PROVIDERS=true → validating remaining providers (diagnostics)..."
+    for entry in "${OTHER_PROVIDERS[@]}"; do
+        IFS=':' read -r pname phost ptransport <<< "${entry}"
+
+        # Skip the one already selected
+        if [[ "${SELECTED_PROVIDER}" == "${pname}" ]]; then
+            printf "  ▸ %s / %s / %-35s ... " "${pname}" "${ptransport}" "${phost}"
+            echo "⊘ ALREADY SELECTED"
+            continue
+        fi
+
+        printf "  ▸ %s / %s / %-35s ... " "${pname}" "${ptransport}" "${phost}"
+        if check_http "${phost}" && validate_with_olcrtc "${pname}" "${ptransport}" "${phost}"; then
+            echo "✓ ROOM CREATED"
+        else
+            echo "✗ FAILED"
+        fi
+    done
+fi
+
+# 2d. Last resort
 if [[ -z "${SELECTED_PROVIDER}" ]]; then
-    warn "All providers failed validation! Using telemost as last resort."
+    warn "All providers failed! Using telemost as last resort."
     SELECTED_PROVIDER="telemost"
     SELECTED_TRANSPORT="vp8channel"
     SELECTED_INSTANCE="telemost.yandex.ru"
@@ -301,13 +314,14 @@ if [[ -z "${SELECTED_PROVIDER}" ]]; then
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Build subscription name
+# STEP 3 — Subscription name
 # ──────────────────────────────────────────────────────────────────────────────
-SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT}"
+HOST_LABEL=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "olcrtc-node")
+SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT} / ${HOST_LABEL}"
 
 echo ""
-log "Step 3/3: Subscription name → ${SUBSCRIPTION_NAME}"
+log "Step 3/3: Subscription → ${SUBSCRIPTION_NAME}"
 echo ""
 
 export SELECTED_PROVIDER SELECTED_TRANSPORT SELECTED_INSTANCE SELECTED_ROOM_ID
-export SELECTED_FLAG SUBSCRIPTION_NAME
+export SELECTED_FLAG SUBSCRIPTION_NAME HOST_LABEL
