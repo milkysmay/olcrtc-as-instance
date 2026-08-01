@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Phase 2: Ping all Jitsi instances, select lowest latency
-# NOTE: no bc dependency — all comparisons use integer arithmetic (ms × 1000)
+# Phase 2: Validate providers by ACTUALLY launching olcrtc and joining a room.
+# Step 1 — quick ping pre-filter (skip dead hosts)
+# Step 2 — real validation: run olcrtc in srv mode, check if room is created
+# Step 3 — detect country flag for subscription name
+
+OLCRTC_BIN="/usr/local/bin/olcrtc"
 
 JITSI_INSTANCES=(
     "meet.egovm.ru"
@@ -20,38 +24,35 @@ JITSI_INSTANCES=(
     "meet.riddlerx.org"
 )
 
+# provider:host:default_transport
 OTHER_PROVIDERS=(
-    "telemost:telemost.yandex.ru"
-    "wbstream:stream.wb.ru"
+    "telemost:telemost.yandex.ru:vp8channel"
+    "wbstream:stream.wb.ru:datachannel"
 )
 
 PING_TIMEOUT=3; PING_COUNT=2; CURL_TIMEOUT=5
+VALIDATE_WAIT=6          # seconds to let olcrtc start
+MAX_VALIDATE_CANDIDATES=5  # don't test all 15 — only top-N by ping
 
-# Returns latency as INTEGER microseconds (ms × 1000), or empty on failure
-measure_latency() {
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+measure_latency_us() {
     local host="$1" latency_ms=""
-
-    # Try ICMP ping first
     if command -v ping &>/dev/null; then
         latency_ms=$(ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" "${host}" 2>/dev/null \
             | grep -oP 'time=\K[0-9.]+' | sort -n | head -1)
     fi
-
-    # Fallback: curl TCP connect time
     if [[ -z "${latency_ms}" ]]; then
-        local connect_s
-        connect_s=$(curl -o /dev/null -s -w '%{time_connect}' \
+        local s
+        s=$(curl -o /dev/null -s -w '%{time_connect}' \
             --connect-timeout "${CURL_TIMEOUT}" "https://${host}/" 2>/dev/null || echo "")
-        if [[ -n "${connect_s}" && "${connect_s}" != "0.000000" ]]; then
-            # Convert seconds → milliseconds (integer)
-            latency_ms=$(awk "BEGIN {printf \"%.0f\", ${connect_s} * 1000}" 2>/dev/null || echo "")
+        if [[ -n "${s}" && "${s}" != "0.000000" ]]; then
+            latency_ms=$(awk "BEGIN{printf \"%.0f\",${s}*1000}" 2>/dev/null || echo "")
         fi
     fi
-
-    # Convert ms (possibly float) → integer microseconds for safe bash comparison
-    if [[ -n "${latency_ms}" ]]; then
-        awk "BEGIN {printf \"%.0f\", ${latency_ms} * 1000}" 2>/dev/null || echo ""
-    fi
+    [[ -n "${latency_ms}" ]] && awk "BEGIN{printf \"%.0f\",${latency_ms}*1000}" 2>/dev/null
 }
 
 check_http() {
@@ -61,53 +62,252 @@ check_http() {
     [[ "${code}" != "000" ]]
 }
 
-log "Checking Jitsi instances (${#JITSI_INSTANCES[@]} hosts)..."
-BEST_INSTANCE=""
-BEST_LATENCY_US=999999999   # integer microseconds
-REACHABLE_COUNT=0
+# Resolve hostname → IPv4
+resolve_ip() {
+    local host="$1" ip=""
+    ip=$(dig +short "${host}" A 2>/dev/null | grep -oP '^\d+\.\d+\.\d+\.\d+$' | head -1)
+    [[ -z "${ip}" ]] && ip=$(getent hosts "${host}" 2>/dev/null | awk '{print $1}' | head -1)
+    echo "${ip}"
+}
+
+# Country code → flag emoji  (NL → 🇳🇱, RU → 🇷🇺)
+country_to_flag() {
+    local cc="${1^^}"
+    [[ ${#cc} -ne 2 ]] && { echo "🏳️"; return; }
+    local flag="" i c ascii code hex
+    for (( i=0; i<2; i++ )); do
+        c="${cc:$i:1}"
+        ascii=$(printf '%d' "'${c}")
+        code=$(( 0x1F1E6 + ascii - 65 ))
+        hex=$(printf '%08x' "${code}")
+        flag+="$(printf "\\U${hex}")"
+    done
+    echo "${flag}"
+}
+
+# Detect country flag for a hostname
+get_flag_for_host() {
+    local host="$1" ip cc=""
+    ip=$(resolve_ip "${host}")
+    if [[ -z "${ip}" ]]; then echo "🏳️"; return; fi
+
+    # Try ip-api.com (free, HTTP only)
+    cc=$(curl -s --connect-timeout 3 \
+        "http://ip-api.com/json/${ip}?fields=countryCode" 2>/dev/null \
+        | grep -oP '"countryCode"\s*:\s*"\K[A-Z]{2}')
+
+    # Fallback: ipwho.is
+    if [[ -z "${cc}" ]]; then
+        cc=$(curl -s --connect-timeout 3 \
+            "https://ipwho.is/${ip}" 2>/dev/null \
+            | grep -oP '"country_code"\s*:\s*"\K[A-Z]{2}')
+    fi
+
+    if [[ -n "${cc}" ]]; then
+        country_to_flag "${cc}"
+    else
+        echo "🏳️"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Real validation: launch olcrtc, try to create a room
+# ──────────────────────────────────────────────────────────────────────────────
+validate_with_olcrtc() {
+    local provider="$1" transport="$2" instance="$3"
+    local test_key test_room room_id tmp_cfg tmp_log pid
+    local elapsed=0 success=false
+
+    test_key=$(openssl rand -hex 32)
+    test_room="validate-${RANDOM}-$(date +%s)"
+
+    case "${provider}" in
+        jitsi) room_id="https://${instance}/${test_room}" ;;
+        *)     room_id="${test_room}" ;;
+    esac
+
+    tmp_cfg="/tmp/olcrtc-val-${provider}-${RANDOM}.yaml"
+    tmp_log="/tmp/olcrtc-val-${provider}-${RANDOM}.log"
+
+    # Write temporary config
+    cat > "${tmp_cfg}" <<EOF
+mode: srv
+auth:
+  provider: ${provider}
+room:
+  id: "${room_id}"
+crypto:
+  key: "${test_key}"
+net:
+  transport: ${transport}
+  dns: "8.8.8.8:53"
+data: data
+debug: true
+EOF
+
+    case "${transport}" in
+        vp8channel)   printf '\nvp8:\n  fps: 30\n  batch_size: 64\n' >> "${tmp_cfg}" ;;
+        seichannel)   printf '\nsei:\n  fps: 30\n  batch_size: 64\n  fragment_size: 900\n  ack_timeout_ms: 2000\n' >> "${tmp_cfg}" ;;
+        videochannel) printf '\nvideo:\n  codec: qrcode\n  width: 1080\n  height: 1080\n  fps: 30\n  bitrate: "5000k"\n  hw: none\n' >> "${tmp_cfg}" ;;
+    esac
+
+    # Launch olcrtc in background
+    "${OLCRTC_BIN}" "${tmp_cfg}" > "${tmp_log}" 2>&1 &
+    pid=$!
+
+    # Poll for up to VALIDATE_WAIT seconds
+    while (( elapsed < VALIDATE_WAIT )); do
+        sleep 1
+        elapsed=$((elapsed + 1))
+
+        # Process died early?
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            wait "${pid}" 2>/dev/null
+            local rc=$?
+            [[ ${rc} -eq 0 ]] && success=true
+            break
+        fi
+
+        # Positive indicators in log
+        if grep -qiE 'room.*(created|ready|started)|connected|listening|initialized' "${tmp_log}" 2>/dev/null; then
+            success=true
+            break
+        fi
+
+        # Fatal errors → stop waiting
+        if grep -qiE 'panic|fatal|failed to (connect|create|join|dial)|connection refused|no such host|unreachable' "${tmp_log}" 2>/dev/null; then
+            break
+        fi
+    done
+
+    # If process is still alive after full wait and no errors → success
+    if (( elapsed >= VALIDATE_WAIT )) && kill -0 "${pid}" 2>/dev/null; then
+        if ! grep -qiE 'panic|fatal|failed|error|refused' "${tmp_log}" 2>/dev/null; then
+            success=true
+        fi
+    fi
+
+    # Cleanup
+    kill "${pid}" 2>/dev/null
+    wait "${pid}" 2>/dev/null
+    rm -f "${tmp_cfg}" "${tmp_log}"
+
+    [[ "${success}" == "true" ]]
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Quick ping pre-filter
+# ──────────────────────────────────────────────────────────────────────────────
+log "Step 1/3: Ping pre-filter for Jitsi instances (${#JITSI_INSTANCES[@]} hosts)..."
+
+declare -a REACHABLE_HOSTS=()
+declare -a REACHABLE_LATENCY=()
 
 for instance in "${JITSI_INSTANCES[@]}"; do
     printf "  %-40s" "${instance}"
-    latency_us=$(measure_latency "${instance}")
-
-    if [[ -n "${latency_us}" && "${latency_us}" -gt 0 ]] 2>/dev/null; then
-        latency_display=$((latency_us / 1000))
-        printf " → %s ms\n" "${latency_display}"
-        REACHABLE_COUNT=$((REACHABLE_COUNT + 1))
-
-        # Pure bash integer comparison — no bc needed
-        if (( latency_us < BEST_LATENCY_US )); then
-            BEST_LATENCY_US="${latency_us}"
-            BEST_INSTANCE="${instance}"
-        fi
+    lat=$(measure_latency_us "${instance}")
+    if [[ -n "${lat}" && "${lat}" -gt 0 ]] 2>/dev/null; then
+        printf " → %s ms\n" "$((lat / 1000))"
+        REACHABLE_HOSTS+=("${instance}")
+        REACHABLE_LATENCY+=("${lat}")
     else
         printf " → unreachable\n"
     fi
 done
 echo ""
 
-log "Checking other providers..."
-for entry in "${OTHER_PROVIDERS[@]}"; do
-    pname="${entry%%:*}"; phost="${entry#*:}"
-    printf "  %-40s" "${pname} (${phost})"
-    if check_http "${phost}"; then printf " → reachable\n"; else printf " → unreachable\n"; fi
-done
-echo ""
-
-if [[ -n "${BEST_INSTANCE}" ]]; then
-    SELECTED_PROVIDER="jitsi"
-    SELECTED_TRANSPORT="datachannel"
-    SELECTED_INSTANCE="${BEST_INSTANCE}"
-    SELECTED_ROOM_ID=""
-    best_ms=$((BEST_LATENCY_US / 1000))
-    log "Best Jitsi instance: ${BEST_INSTANCE} (${best_ms} ms)"
-    log "Selected: jitsi + datachannel (recommended)"
-else
-    warn "No Jitsi instance reachable! Falling back to telemost + vp8channel"
-    SELECTED_PROVIDER="telemost"
-    SELECTED_TRANSPORT="vp8channel"
-    SELECTED_INSTANCE=""
-    SELECTED_ROOM_ID=""
+# Sort reachable hosts by latency (simple insertion sort)
+if (( ${#REACHABLE_HOSTS[@]} > 1 )); then
+    for (( i=1; i<${#REACHABLE_HOSTS[@]}; i++ )); do
+        local_h="${REACHABLE_HOSTS[$i]}"
+        local_l="${REACHABLE_LATENCY[$i]}"
+        j=$((i - 1))
+        while (( j >= 0 )) && (( REACHABLE_LATENCY[j] > local_l )); do
+            REACHABLE_HOSTS[$((j+1))]="${REACHABLE_HOSTS[$j]}"
+            REACHABLE_LATENCY[$((j+1))]="${REACHABLE_LATENCY[$j]}"
+            j=$((j - 1))
+        done
+        REACHABLE_HOSTS[$((j+1))]="${local_h}"
+        REACHABLE_LATENCY[$((j+1))]="${local_l}"
+    done
 fi
 
+log "Reachable: ${#REACHABLE_HOSTS[@]} / ${#JITSI_INSTANCES[@]}"
+echo ""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Real validation via olcrtc (top-N candidates)
+# ──────────────────────────────────────────────────────────────────────────────
+log "Step 2/3: Real validation — creating room via olcrtc (top ${MAX_VALIDATE_CANDIDATES})..."
+echo ""
+
+SELECTED_PROVIDER=""
+SELECTED_TRANSPORT=""
+SELECTED_INSTANCE=""
+SELECTED_ROOM_ID=""
+SELECTED_FLAG="🏳️"
+SUBSCRIPTION_NAME=""
+
+# 2a. Try Jitsi candidates
+limit=$(( ${#REACHABLE_HOSTS[@]} < MAX_VALIDATE_CANDIDATES ? ${#REACHABLE_HOSTS[@]} : MAX_VALIDATE_CANDIDATES ))
+for (( i=0; i<limit; i++ )); do
+    inst="${REACHABLE_HOSTS[$i]}"
+    lat_ms=$(( REACHABLE_LATENCY[i] / 1000 ))
+    printf "  ▸ jitsi / datachannel / %-35s (%s ms) ... " "${inst}" "${lat_ms}"
+
+    if validate_with_olcrtc "jitsi" "datachannel" "${inst}"; then
+        echo "✓ ROOM CREATED"
+        SELECTED_PROVIDER="jitsi"
+        SELECTED_TRANSPORT="datachannel"
+        SELECTED_INSTANCE="${inst}"
+        SELECTED_ROOM_ID=""
+        SELECTED_FLAG=$(get_flag_for_host "${inst}")
+        break
+    else
+        echo "✗ FAILED"
+    fi
+done
+
+# 2b. If no Jitsi passed — try other providers
+if [[ -z "${SELECTED_PROVIDER}" ]]; then
+    echo ""
+    log "No Jitsi instance passed validation. Trying other providers..."
+    for entry in "${OTHER_PROVIDERS[@]}"; do
+        IFS=':' read -r pname phost ptransport <<< "${entry}"
+        printf "  ▸ %s / %s / %-35s ... " "${pname}" "${ptransport}" "${phost}"
+
+        if check_http "${phost}" && validate_with_olcrtc "${pname}" "${ptransport}" "${phost}"; then
+            echo "✓ ROOM CREATED"
+            SELECTED_PROVIDER="${pname}"
+            SELECTED_TRANSPORT="${ptransport}"
+            SELECTED_INSTANCE="${phost}"
+            SELECTED_ROOM_ID=""
+            SELECTED_FLAG=$(get_flag_for_host "${phost}")
+            break
+        else
+            echo "✗ FAILED"
+        fi
+    done
+fi
+
+# 2c. Last resort
+if [[ -z "${SELECTED_PROVIDER}" ]]; then
+    warn "All providers failed validation! Using telemost as last resort."
+    SELECTED_PROVIDER="telemost"
+    SELECTED_TRANSPORT="vp8channel"
+    SELECTED_INSTANCE="telemost.yandex.ru"
+    SELECTED_ROOM_ID=""
+    SELECTED_FLAG=$(get_flag_for_host "telemost.yandex.ru")
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Build subscription name
+# ──────────────────────────────────────────────────────────────────────────────
+SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT}"
+
+echo ""
+log "Step 3/3: Subscription name → ${SUBSCRIPTION_NAME}"
+echo ""
+
 export SELECTED_PROVIDER SELECTED_TRANSPORT SELECTED_INSTANCE SELECTED_ROOM_ID
+export SELECTED_FLAG SUBSCRIPTION_NAME
