@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Phase 3: Create YAML config + crypto key + olcrtc:// URI + subscription name
-
 SCRIPTS_DIR="${SCRIPTS_DIR:-/opt/olcrtc/scripts}"
 CONFIG_DIR="${CONFIG_DIR:-/opt/olcrtc/config}"
 CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/olcrtc.yaml}"
@@ -8,14 +6,12 @@ CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/olcrtc.yaml}"
 # ── Crypto key ──
 if [[ -n "${OLCRTC_CRYPTO_KEY:-}" ]]; then
     CRYPTO_KEY="${OLCRTC_CRYPTO_KEY}"
-    log "Crypto key: loaded from ENV"
+    log "Crypto key: from ENV"
 else
     CRYPTO_KEY=$(openssl rand -hex 32)
-    log "Crypto key: generated new"
+    log "Crypto key: generated"
 fi
-if [[ ${#CRYPTO_KEY} -ne 64 ]]; then
-    err "Crypto key must be exactly 64 hex chars (got ${#CRYPTO_KEY})"; exit 1
-fi
+[[ ${#CRYPTO_KEY} -ne 64 ]] && { err "Key must be 64 hex chars"; exit 1; }
 
 # ── Room ID ──
 if [[ -n "${OLCRTC_ROOM_ID:-}" ]]; then
@@ -26,20 +22,19 @@ else
         jitsi) ROOM_ID="https://${SELECTED_INSTANCE:-meet.egovm.ru}/${ROOM_NAME}" ;;
         *)     ROOM_ID="${ROOM_NAME}" ;;
     esac
-    log "Room ID: generated → ${ROOM_ID}"
+    log "Room ID: ${ROOM_ID}"
 fi
 
-# ── Subscription name (flag | provider | transport) ──
-if [[ -z "${SUBSCRIPTION_NAME:-}" ]]; then
-    SELECTED_FLAG="${SELECTED_FLAG:-🏳️}"
-    SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT}"
-fi
+# ── Subscription name ──
+HOST_LABEL="${HOST_LABEL:-$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "olcrtc-node")}"
+SELECTED_FLAG="${SELECTED_FLAG:-🏳️}"
+SUBSCRIPTION_NAME="${SELECTED_FLAG} | ${SELECTED_PROVIDER} | ${SELECTED_TRANSPORT} / ${HOST_LABEL}"
 log "Subscription: ${SUBSCRIPTION_NAME}"
 
 DNS="${OLCRTC_DNS:-8.8.8.8:53}"
 MODE="${OLCRTC_MODE:-srv}"
 
-# ── Write YAML ──
+# ── YAML ──
 cat > "${CONFIG_FILE}" <<EOF
 # ${SUBSCRIPTION_NAME}
 mode: ${MODE}
@@ -75,7 +70,7 @@ if [[ "${MODE}" == "srv" && -n "${OLCRTC_UPSTREAM_PROXY_ADDR:-}" ]]; then
         "${OLCRTC_UPSTREAM_PROXY_ADDR}" "${OLCRTC_UPSTREAM_PROXY_PORT:-1080}" >> "${CONFIG_FILE}"
 fi
 
-# ── olcrtc:// URI ──
+# ── olcrtc:// URI (no $auto) ──
 PAYLOAD=""
 case "${SELECTED_TRANSPORT}" in
     vp8channel)   PAYLOAD="<vp8-fps=30&vp8-batch=64>" ;;
@@ -83,10 +78,9 @@ case "${SELECTED_TRANSPORT}" in
     videochannel) PAYLOAD="<video-w=1080&video-h=1080&video-fps=30&video-bitrate=5000k&video-hw=none&video-codec=qrcode>" ;;
 esac
 
-HOST_LABEL=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "olcrtc-node")
-OLCRTC_URI="olcrtc://${SELECTED_PROVIDER}?${SELECTED_TRANSPORT}${PAYLOAD}@${ROOM_ID}#${CRYPTO_KEY}\$auto / ${SUBSCRIPTION_NAME} / ${HOST_LABEL}"
+OLCRTC_URI="olcrtc://${SELECTED_PROVIDER}?${SELECTED_TRANSPORT}${PAYLOAD}@${ROOM_ID}#${CRYPTO_KEY} / ${SUBSCRIPTION_NAME}"
 
-export CRYPTO_KEY ROOM_ID OLCRTC_URI CONFIG_FILE SUBSCRIPTION_NAME SELECTED_FLAG
+export CRYPTO_KEY ROOM_ID OLCRTC_URI CONFIG_FILE SUBSCRIPTION_NAME SELECTED_FLAG HOST_LABEL
 
-log "Config file:"
+log "Config:"
 cat "${CONFIG_FILE}"
