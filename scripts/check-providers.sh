@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Phase 2: Ping all Jitsi instances, select lowest latency
+# NOTE: no bc dependency — all comparisons use integer arithmetic (ms × 1000)
 
 JITSI_INSTANCES=(
     "meet.egovm.ru"
@@ -26,22 +27,31 @@ OTHER_PROVIDERS=(
 
 PING_TIMEOUT=3; PING_COUNT=2; CURL_TIMEOUT=5
 
+# Returns latency as INTEGER microseconds (ms × 1000), or empty on failure
 measure_latency() {
-    local host="$1" latency=""
+    local host="$1" latency_ms=""
+
+    # Try ICMP ping first
     if command -v ping &>/dev/null; then
-        latency=$(ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" "${host}" 2>/dev/null \
+        latency_ms=$(ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" "${host}" 2>/dev/null \
             | grep -oP 'time=\K[0-9.]+' | sort -n | head -1)
     fi
-    if [[ -z "${latency}" ]]; then
-        latency=$(curl -o /dev/null -s -w '%{time_connect}' \
+
+    # Fallback: curl TCP connect time
+    if [[ -z "${latency_ms}" ]]; then
+        local connect_s
+        connect_s=$(curl -o /dev/null -s -w '%{time_connect}' \
             --connect-timeout "${CURL_TIMEOUT}" "https://${host}/" 2>/dev/null || echo "")
-        if [[ -n "${latency}" && "${latency}" != "0.000000" ]]; then
-            latency=$(echo "${latency} * 1000" | bc 2>/dev/null || echo "")
-        else
-            latency=""
+        if [[ -n "${connect_s}" && "${connect_s}" != "0.000000" ]]; then
+            # Convert seconds → milliseconds (integer)
+            latency_ms=$(awk "BEGIN {printf \"%.0f\", ${connect_s} * 1000}" 2>/dev/null || echo "")
         fi
     fi
-    echo "${latency}"
+
+    # Convert ms (possibly float) → integer microseconds for safe bash comparison
+    if [[ -n "${latency_ms}" ]]; then
+        awk "BEGIN {printf \"%.0f\", ${latency_ms} * 1000}" 2>/dev/null || echo ""
+    fi
 }
 
 check_http() {
@@ -52,17 +62,23 @@ check_http() {
 }
 
 log "Checking Jitsi instances (${#JITSI_INSTANCES[@]} hosts)..."
-BEST_INSTANCE=""; BEST_LATENCY=999999; REACHABLE_COUNT=0
+BEST_INSTANCE=""
+BEST_LATENCY_US=999999999   # integer microseconds
+REACHABLE_COUNT=0
 
 for instance in "${JITSI_INSTANCES[@]}"; do
     printf "  %-40s" "${instance}"
-    latency=$(measure_latency "${instance}")
-    if [[ -n "${latency}" ]]; then
-        printf " → %s ms\n" "${latency%%.*}"
+    latency_us=$(measure_latency "${instance}")
+
+    if [[ -n "${latency_us}" && "${latency_us}" -gt 0 ]] 2>/dev/null; then
+        latency_display=$((latency_us / 1000))
+        printf " → %s ms\n" "${latency_display}"
         REACHABLE_COUNT=$((REACHABLE_COUNT + 1))
-        is_better=$(echo "${latency} < ${BEST_LATENCY}" | bc 2>/dev/null || echo "0")
-        if [[ "${is_better}" == "1" ]]; then
-            BEST_LATENCY="${latency}"; BEST_INSTANCE="${instance}"
+
+        # Pure bash integer comparison — no bc needed
+        if (( latency_us < BEST_LATENCY_US )); then
+            BEST_LATENCY_US="${latency_us}"
+            BEST_INSTANCE="${instance}"
         fi
     else
         printf " → unreachable\n"
@@ -79,14 +95,19 @@ done
 echo ""
 
 if [[ -n "${BEST_INSTANCE}" ]]; then
-    SELECTED_PROVIDER="jitsi"; SELECTED_TRANSPORT="datachannel"
-    SELECTED_INSTANCE="${BEST_INSTANCE}"; SELECTED_ROOM_ID=""
-    log "Best Jitsi instance: ${BEST_INSTANCE} (${BEST_LATENCY%%.*} ms)"
-    log "Selected: jitsi + datachannel (recommended combination)"
+    SELECTED_PROVIDER="jitsi"
+    SELECTED_TRANSPORT="datachannel"
+    SELECTED_INSTANCE="${BEST_INSTANCE}"
+    SELECTED_ROOM_ID=""
+    best_ms=$((BEST_LATENCY_US / 1000))
+    log "Best Jitsi instance: ${BEST_INSTANCE} (${best_ms} ms)"
+    log "Selected: jitsi + datachannel (recommended)"
 else
     warn "No Jitsi instance reachable! Falling back to telemost + vp8channel"
-    SELECTED_PROVIDER="telemost"; SELECTED_TRANSPORT="vp8channel"
-    SELECTED_INSTANCE=""; SELECTED_ROOM_ID=""
+    SELECTED_PROVIDER="telemost"
+    SELECTED_TRANSPORT="vp8channel"
+    SELECTED_INSTANCE=""
+    SELECTED_ROOM_ID=""
 fi
 
 export SELECTED_PROVIDER SELECTED_TRANSPORT SELECTED_INSTANCE SELECTED_ROOM_ID
